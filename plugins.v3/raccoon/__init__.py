@@ -39,7 +39,7 @@ class Raccoon(_PluginBase):
     plugin_name = "浣熊"
     plugin_desc = "你只管下和看：转种、删片腾空间、清死种，浣熊都替你收拾好。"
     plugin_icon = "raccoon.png"
-    plugin_version = "0.4.4"
+    plugin_version = "0.4.5"
     plugin_author = "feng"
     author_url = ""
     plugin_config_prefix = "raccoon_"
