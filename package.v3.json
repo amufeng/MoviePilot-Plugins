@@ -2,7 +2,7 @@
   "Raccoon": {
     "name": "浣熊",
     "description": "你只管下和看：转种、删片腾空间、清死种，浣熊都替你收拾好。",
-    "labels": "媒体库,做种,整理",
+    "labels": "媒体库,做种,整理,下载,Transmission,qBittorrent",
     "version": "0.4.3",
     "author": "feng",
     "level": 1,
