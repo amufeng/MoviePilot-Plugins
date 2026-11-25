@@ -8,7 +8,6 @@
 
 MoviePilot V3 插件 · qBittorrent 下载 × Transmission 做种 · 全链路托管
 
-作者：feng 与 Muse（共同作者）
 
 ![MoviePilot](https://img.shields.io/badge/MoviePilot-V3-6366f1)
 ![Version](https://img.shields.io/badge/version-0.6.3-14b8a6)
