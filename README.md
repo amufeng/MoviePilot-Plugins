@@ -8,8 +8,10 @@
 
 MoviePilot V3 插件 · qBittorrent 下载 × Transmission 做种 · 全链路托管
 
+作者：feng 与 Muse（共同作者）
+
 ![MoviePilot](https://img.shields.io/badge/MoviePilot-V3-6366f1)
-![Version](https://img.shields.io/badge/version-0.4.3-14b8a6)
+![Version](https://img.shields.io/badge/version-0.6.3-14b8a6)
 ![License](https://img.shields.io/badge/license-GPL--3.0-f59e0b)
 ![Python](https://img.shields.io/badge/Python-3-0ea5e9)
 
@@ -77,5 +79,6 @@ MoviePilot V3 插件 · qBittorrent 下载 × Transmission 做种 · 全链路�
 
 ## 📜 版本与许可
 
+- 共同作者：feng 与 Muse
 - 版本历史见 [package.v3.json](package.v3.json) 中 Raccoon 条目的 `history`
 - 本插件以 [GPL-3.0](LICENSE) 许可发布

@@ -14,8 +14,11 @@
 - 全部破坏性动作受 dry_run 总闸控制：dry_run=True 时只记录与通知，不真删、不真转。
 """
 import os
+import re
 import threading
 import time
+import unicodedata
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,8 +42,8 @@ class Raccoon(_PluginBase):
     plugin_name = "浣熊"
     plugin_desc = "你只管下和看：转种、删片腾空间、清死种，浣熊都替你收拾好。"
     plugin_icon = "raccoon.png"
-    plugin_version = "0.4.5"
-    plugin_author = "feng"
+    plugin_version = "0.6.3"
+    plugin_author = "feng & Muse"
     author_url = ""
     plugin_config_prefix = "raccoon_"
     plugin_order = 50
@@ -61,14 +64,23 @@ class Raccoon(_PluginBase):
     _transfer_run_once = False
     _download_root = "/vol4/1000/Download"
     _library_root = "/vol4/1000/MediaLib"
-    _music_download_root = "/vol4/1000/Download"
-    _music_library_root = "/vol3/1000/MusicLib"
+    _music_download_root = "/vol3/1000/MusicLib"
+    _music_library_root = "/vol3/1000/MusicView"
+    _music_enabled = False
+    _music_run_once = False
     _bt_backup = "/BT_backup"
 
     # ---------------- 运行时 ----------------
     _lock = threading.Lock()
     _state: Dict[str, Any] = {}
     _tick_busy = False
+    _music_ready = False
+    _music_org_busy = False
+    _music_det_busy = False
+    _music_album_map: Dict[str, Any] = {}
+    _music_base_map: Dict[str, Any] = {}
+    _music_existing: Any = set()
+    _music_artist_lang: Dict[str, Any] = {}
 
     # ============================================================
     # 生命周期
@@ -101,6 +113,8 @@ class Raccoon(_PluginBase):
         self._music_download_root = str(config.get("music_download_root") or self._music_download_root).rstrip("/")
         self._music_library_root = str(config.get("music_library_root") or self._music_library_root).rstrip("/")
         self._music_base_root = str(config.get("music_base_root") or "").rstrip("/")
+        self._music_enabled = bool(config.get("music_enabled", False))
+        self._music_run_once = bool(config.get("music_run_once", False))
         self._state = self.get_data(STATE_KEY) or {}
         for k, v in (("links", {}), ("pending_deletes", []), ("pending_transfers", {}),
                      ("done_transfers", {}), ("stock_done", []), ("stock_failed", {}),
@@ -110,14 +124,18 @@ class Raccoon(_PluginBase):
                      ("transfer_blocked", {}), ("pending_approval", []),
                      ("audit", []), ("stock_uncovered", {}),
                      ("last_approval_notify", 0), ("sweep_rejected", {}),
-                     ("last_transfer_day", "")):
+                     ("last_transfer_day", ""),
+                     ("music_done", {}), ("music_failed", {}),
+                     ("music_pending", []), ("music_rejected", {}),
+                     ("music_last_organize", 0), ("music_last_detect", 0)):
             self._state.setdefault(k, v)
         _onoff = lambda b: "开" if b else "关"
         logger.info(
             f"浣熊 已加载：{'已停用' if not self._enabled else ('试运行' if self._dry_run else '正式运行')}，"
             f"转种 {_onoff(self._transfer_enabled)}，删片联动 {_onoff(self._sync_delete_enabled)}，"
             f"清死种 {_onoff(self._sweep_enabled)}，自动删除 {_onoff(self._auto_delete)}，"
-            f"删除延迟 {self._delete_delay_minutes} 分钟，映射 {len(self._state.get('links', {}))} 条"
+            f"删除延迟 {self._delete_delay_minutes} 分钟，映射 {len(self._state.get('links', {}))} 条，"
+            f"音乐整理 {_onoff(self._music_enabled)}"
         )
         if self._enabled and self._stock_run_once:
             threading.Thread(target=self._stock_job_entry, daemon=True).start()
@@ -127,6 +145,10 @@ class Raccoon(_PluginBase):
             threading.Thread(target=self._approval_job_entry, args=(True,), daemon=True).start()
         if self._enabled and self._reject_once:
             threading.Thread(target=self._approval_job_entry, args=(False,), daemon=True).start()
+        if self._enabled and self._music_enabled:
+            threading.Thread(target=self._music_bootstrap, daemon=True).start()
+        if self._enabled and self._music_enabled and self._music_run_once:
+            threading.Thread(target=self._music_job_entry, daemon=True).start()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -274,6 +296,7 @@ class Raccoon(_PluginBase):
             "5. 存量整理：打开「马上整理一批存量」并保存，按「存量每批整理数量」处理一批还没整理的片子，执行完开关自动关闭。",
             "6. 音乐基础库（可选）：把一套现成音乐库的目录填进「音乐基础库」，它就成为整理时的基准；在音乐整理目录里删基础库的歌只删镜像，基础库的原件永远不动，不填则没有基础库。从做种目录整理进来的专辑不受此限。",
             "7. QB转种TR：两个条件都满足就转——qB 已下载完成、种子文件逐个核对完整；跟是什么资源、整没整理进整理目录无关。暂停在 qB 里的种子，qB 显示的进度可能不准，按磁盘文件核对，文件完整就照样转。文件不全的会被拦下并通知，补齐后自动放行。「转种时机」选立即就是随时转，选每天/每周一就攒到那个时间点统一转；打开「立即转种一次」保存，可无视时机马上转一批，执行完开关自动关闭，并发一条结果通知（转了几个、没转成的原因）。已经开始的转种（TR 校验、做种确认）不受时机影响，会一直跟进到底。",
+            "8. 音乐整理：打开「音乐整理」后，做种目录里新出现的专辑自动整理进音乐整理目录，按语种、歌手、专辑归位，基础库里已有的歌不重复收。删歌联动和视频同一套规矩：音乐整理目录里删掉专辑的歌，做种目录里的原件等上面设的等待分钟数后跟着删；反过来也一样。基础库的歌在音乐整理目录里只有一份镜像，删镜像不碰基础库原件；基础库原件被删时，镜像跟着清。",
         ]
 
         return [
@@ -323,7 +346,9 @@ class Raccoon(_PluginBase):
                                 "mdi-folder-star-outline")], md=6)),
                 ]),
                 section("音乐目录", "mdi-music", "#6366f1", [
-                    row(col([tf("music_download_root", "音乐下载目录",
+                    row(col([sw("music_enabled", "音乐整理", "#6366f1")], md=4),
+                        col([sw("music_run_once", "立即整理一次", "#6366f1")], md=4)),
+                    row(col([tf("music_download_root", "音乐做种目录",
                                 "mdi-folder-download-outline")], md=6),
                         col([tf("music_library_root", "音乐整理目录",
                                 "mdi-folder-music-outline")], md=6)),
@@ -343,8 +368,9 @@ class Raccoon(_PluginBase):
             "approve_deletes_once": False, "reject_deletes_once": False,
             "transfer_mode": "now", "transfer_run_once": False,
             "download_root": "/vol4/1000/Download", "library_root": "/vol4/1000/MediaLib",
-            "music_download_root": "/vol4/1000/Download", "music_library_root": "/vol3/1000/MusicLib",
+            "music_download_root": "/vol3/1000/MusicLib", "music_library_root": "/vol3/1000/MusicView",
             "music_base_root": "",
+            "music_enabled": False, "music_run_once": False,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -471,6 +497,18 @@ class Raccoon(_PluginBase):
                            f"等联动删除 {len(st.get('pending_deletes', []))} 项")},
              ]},
         ]
+        if self._music_enabled:
+            board_rows.append(
+                {"component": "VRow", "content": [
+                    stat("mdi-music", "#ec4899",
+                         len(st.get("music_done", {})), "音乐已整理专辑（张）"),
+                    stat("mdi-link-variant", "#a855f7",
+                         len(getattr(self, "_music_album_map", {})), "专辑配对文件（份）"),
+                    stat("mdi-database-outline", "#64748b",
+                         len(getattr(self, "_music_base_map", {})), "基础配对文件（份）"),
+                    stat("mdi-timer-sand", "#f59e0b",
+                         len(st.get("music_pending", [])), "音乐等联动删除（项）"),
+                ]})
         for v in list(st.get("transfer_blocked", {}).values())[:5]:
             board_rows.append(
                 {"component": "div",
@@ -621,6 +659,13 @@ class Raccoon(_PluginBase):
                 self._sweep_dead()
                 self._check_pending_verify_qb()
                 self._sweep_dead_qb()
+            if self._music_enabled and self._music_ready:
+                _now = time.time()
+                if _now - float(self._state.get("music_last_organize", 0)) >= 600:
+                    threading.Thread(target=self._music_organize_pass, daemon=True).start()
+                if _now - float(self._state.get("music_last_detect", 0)) >= 900:
+                    threading.Thread(target=self._music_detect, daemon=True).start()
+                self._music_execute_pendings()
         except Exception as e:
             logger.error(f"浣熊 巡检异常: {e}", exc_info=True)
         finally:
@@ -876,6 +921,8 @@ class Raccoon(_PluginBase):
         for i in items[:8]:
             if i.get("kind") == "file":
                 lines.append(f"文件：{i.get('twin')}")
+            elif i.get("kind") == "music":
+                lines.append(f"音乐文件：{i.get('twin')}")
             else:
                 lines.append(f"种子记录：{i.get('name')}")
         more = f"\n……另有 {len(items) - 8} 项" if len(items) > 8 else ""
@@ -934,6 +981,12 @@ class Raccoon(_PluginBase):
         self._state["pending_approval"] = []
         n_files = n_records = n_skip = 0
         for item in items:
+            if item.get("kind") == "music":
+                if self._music_execute_delete(item):
+                    n_files += 1
+                else:
+                    n_skip += 1
+                continue
             if item.get("kind") == "record":
                 if self._remove_one_record(item.get("hash"), item.get("name"),
                                             source=item.get("source", "TR")):
@@ -1735,6 +1788,8 @@ class Raccoon(_PluginBase):
                     link["delete_rejected"] = True
             if item.get("kind") == "record" and item.get("hash"):
                 self._state.setdefault("sweep_rejected", {})[item["hash"]] = now
+            if item.get("kind") == "music" and item.get("key"):
+                self._state.setdefault("music_rejected", {})[item["key"]] = now
         self._audit("approval_rejected", "pending_approval", f"用户驳回 {len(items)} 项待删，不执行")
         self._save_state()
         return len(items)
@@ -1993,3 +2048,425 @@ class Raccoon(_PluginBase):
             text += (f"\n文件级审计：{len(unc)} 个条目有未覆盖文件（已留痕）：\n"
                      + "\n".join(f"{n}：{len(u)} 个" for n, u in unc))
         self._notify("浣熊 · 存量处理完成", text)
+
+    # ============================================================
+    # 音乐整理：做种目录专辑 -> 音乐整理目录（硬链接），与视频同一套安全纪律
+    # - 专辑配对（做种目录 <-> 整理目录）：双向同步删除
+    # - 基础配对（基础库 MUSIC <-> 整理目录）：只删整理目录一侧，基础库原件永不删
+    # ============================================================
+    _MUSIC_AUDIO = {".flac", ".mp3", ".m4a", ".wav", ".ape", ".ogg", ".aac", ".opus"}
+
+    @staticmethod
+    def _mu_norm(s):
+        s = unicodedata.normalize("NFKC", s or "").lower()
+        s = re.sub(r"[\[\(（\{【].*?[\]\)）\}】]", "", s)
+        return re.sub(r"[^a-z0-9\u4e00-\u9fff\uac00-\ud7a3\u3040-\u30ff]+", "", s)
+
+    @staticmethod
+    def _mu_clean_name(s):
+        s = unicodedata.normalize("NFKC", s or "").strip()
+        s = re.sub(r"[《》【】\[\]]", "", s)
+        s = re.sub(r"[/:\\?*\"<>|]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @classmethod
+    def _mu_clean_album(cls, s):
+        s = cls._mu_clean_name(s)
+        s = re.sub(r"\s+[A-Z]{2,}[A-Z0-9]*-\d{2,}[A-Z0-9]*$", "", s)
+        for _ in range(3):
+            m = re.search(r"\s*[\(\（]([^\(\)（）]*)[\)\）]$", s)
+            if m and re.search(r"版|限量|周年|週年|24K|Gold|gold", m.group(1)):
+                s = s[:m.start()].strip()
+            else:
+                break
+        return s
+
+    def _mu_tags(self, path):
+        try:
+            from mutagen import File as _MFile
+            m = _MFile(path, easy=True)
+            t = (m.tags if m else None) or {}
+            g = lambda k: (t.get(k) or [""])[0].strip()
+            return {"artist": g("artist"), "albumartist": g("albumartist"),
+                    "album": g("album"), "title": g("title"),
+                    "date": g("date"), "disc": g("discnumber")}
+        except Exception:
+            return None
+
+    def _mu_folder_parse(self, name):
+        m = re.match(r"^(.+?)\s+-\s+(.+)$", name)
+        if not m:
+            return None
+        artist, album = m.group(1).strip(), m.group(2).strip()
+        year = ""
+        ym = re.search(r"\((\d{4})\)", album)
+        if ym:
+            year = ym.group(1)
+        album = re.sub(r"[\[\(\{].*?[\]\)\}]", "", album).strip()
+        if artist in ("V.A", "VA", "Various", "Various Artists"):
+            artist = "Various Artists"
+        return artist, album, year
+
+    def _mu_file_title(self, fn, artist):
+        base = os.path.splitext(fn)[0]
+        if " - " in base:
+            left, right = base.split(" - ", 1)
+            if self._mu_norm(left) == self._mu_norm(artist) and artist:
+                base = right
+        base = re.sub(r"^(cd\s*\d+[\s._-]*)?(\d{1,3})[\s._-]+", "", base, flags=re.I)
+        return base.strip()
+
+    def _mu_lang_of(self, artist, title, folder):
+        if self._mu_norm(artist) in self._music_artist_lang:
+            return self._music_artist_lang[self._mu_norm(artist)]
+        if re.search(r"[\u3040-\u30ff\uac00-\ud7a3]", folder or ""):
+            return "日韩音乐"
+        s = (artist or "") + (title or "")
+        if re.search(r"[\uac00-\ud7a3\u3040-\u30ff]", s):
+            return "日韩音乐"
+        if re.search(r"[\u4e00-\u9fff]", s):
+            return "中文音乐"
+        return "欧美音乐"
+
+    # ---------- 启动：从磁盘实况重建配对表与去重索引 ----------
+    def _music_bootstrap(self):
+        try:
+            view = self._music_library_root
+            root = self._music_download_root
+            base = self._music_base_root
+            if not (os.path.isdir(view) and os.path.isdir(root)):
+                logger.warning("浣熊 音乐整理未就绪：音乐整理目录或做种目录不存在")
+                return
+            artist_lang = {}
+            if base and os.path.isdir(base):
+                for lang in os.listdir(base):
+                    lp = os.path.join(base, lang)
+                    if os.path.isdir(lp):
+                        for a in os.listdir(lp):
+                            if os.path.isdir(os.path.join(lp, a)):
+                                artist_lang[self._mu_norm(a)] = lang
+            self._music_artist_lang = artist_lang
+            base_ino, root_ino = {}, {}
+            if base and os.path.isdir(base):
+                for dp, _dn, fs in os.walk(base):
+                    for f in fs:
+                        p = os.path.join(dp, f)
+                        try:
+                            st = os.stat(p)
+                        except OSError:
+                            continue
+                        base_ino[f"{st.st_dev}:{st.st_ino}"] = p
+            for n in os.listdir(root):
+                p = os.path.join(root, n)
+                if n == "MUSIC" or not os.path.isdir(p):
+                    continue
+                for dp, _dn, fs in os.walk(p):
+                    for f in fs:
+                        fp = os.path.join(dp, f)
+                        try:
+                            st = os.stat(fp)
+                        except OSError:
+                            continue
+                        root_ino[f"{st.st_dev}:{st.st_ino}"] = fp
+            album_map, base_map, existing = {}, {}, set()
+            for dp, _dn, fs in os.walk(view):
+                for f in fs:
+                    p = os.path.join(dp, f)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    key = f"{st.st_dev}:{st.st_ino}"
+                    if key in base_ino:
+                        base_map[key] = {"view": p, "src": base_ino[key]}
+                    elif key in root_ino:
+                        album_map[key] = {"view": p, "src": root_ino[key]}
+                    if os.path.splitext(f)[1].lower() in self._MUSIC_AUDIO:
+                        parts = os.path.relpath(p, view).split(os.sep)
+                        art = self._mu_norm(parts[1]) if len(parts) > 2 else ""
+                        b = os.path.splitext(f)[0]
+                        if " - " in b:
+                            b = b.split(" - ", 1)[1]
+                        existing.add((art, self._mu_norm(b)))
+            self._music_album_map = album_map
+            self._music_base_map = base_map
+            self._music_existing = existing
+            self._music_ready = True
+            logger.info(f"浣熊 音乐整理就绪：专辑配对 {len(album_map)} 份，基础配对 {len(base_map)} 份，"
+                        f"已入库歌曲索引 {len(existing)} 首，已整理专辑 {len(self._state.get('music_done', {}))} 张")
+        except Exception as e:
+            logger.error(f"浣熊 音乐整理启动失败: {e}", exc_info=True)
+
+    # ---------- 整理一张专辑（口径与存量整理脚本一致） ----------
+    def _music_process_album(self, name):
+        root = self._music_download_root
+        view = self._music_library_root
+        p = os.path.join(root, name)
+        fs = []
+        for dp, _dn, fns in os.walk(p):
+            for f in fns:
+                if os.path.splitext(f)[1].lower() in self._MUSIC_AUDIO:
+                    fs.append(os.path.join(dp, f))
+        if not fs:
+            return ("failed", "没有音频文件", 0, 0)
+        ts = [self._mu_tags(f) for f in fs]
+        if any(t is None for t in ts):
+            return ("failed", "标签读取失败", 0, 0)
+        fp = self._mu_folder_parse(name)
+        if not fp:
+            b = re.sub(r"^(\d{4}\s+\d{2}\s+\d{2}\s+|\d{4}\s+|CD\d+\s*)", "", name)
+            if "：" in b or ":" in b:
+                a2, b2 = re.split(r"[：:]", b, 1)
+                fp = (a2.strip(), b2.strip(), "")
+            else:
+                fp = ("Various Artists", b.strip(), "")
+        if any(not t["album"] or not (t["artist"] or t["albumartist"]) for t in ts):
+            for t, f in zip(ts, fs):
+                t["album"] = t["album"] or fp[1]
+                t["artist"] = t["artist"] or fp[0]
+                t["title"] = t["title"] or self._mu_file_title(os.path.basename(f), fp[0])
+        aa = Counter(t["albumartist"] or t["artist"] for t in ts).most_common(1)[0][0]
+        alb = Counter(t["album"] for t in ts).most_common(1)[0][0]
+        yrs = Counter(t["date"][:4] for t in ts if t["date"][:4].isdigit()).most_common(1)
+        year = yrs[0][0] if yrs else (fp[2] if fp else "")
+        lang = self._mu_lang_of(aa, ts[0]["title"], name)
+        album_dir = self._mu_clean_name(
+            f"{self._mu_clean_name(aa)} - {self._mu_clean_album(alb)}" + (f" ({year})" if year else ""))
+        dest_dir = os.path.join(view, lang, self._mu_clean_name(aa), album_dir)
+        discs = set(t["disc"].split("/")[0] for t in ts if t["disc"])
+        multi = len(discs) > 1
+        linked = skipped = 0
+        new_pairs = []
+        for f, t in zip(fs, ts):
+            k = (self._mu_norm(aa), self._mu_norm(t["title"]))
+            if k in self._music_existing:
+                skipped += 1
+                continue
+            title = self._mu_clean_name(t["title"]) or os.path.splitext(os.path.basename(f))[0]
+            art = self._mu_clean_name(t["artist"] or aa)
+            fn = f"{art} - {title}{os.path.splitext(f)[1].lower()}"
+            dd = os.path.join(dest_dir, "CD" + (t["disc"].split("/")[0] or "1")) if multi else dest_dir
+            dst = os.path.join(dd, fn)
+            if os.path.exists(dst):
+                skipped += 1
+                continue
+            os.makedirs(dd, exist_ok=True)
+            os.link(f, dst)
+            st = os.stat(f)
+            new_pairs.append((f"{st.st_dev}:{st.st_ino}", {"view": dst, "src": f}))
+            self._music_existing.add(k)
+            linked += 1
+        for f in os.listdir(p):
+            src = os.path.join(p, f)
+            if os.path.isfile(src) and os.path.splitext(f)[1].lower() not in self._MUSIC_AUDIO:
+                dst = os.path.join(dest_dir, f)
+                if not os.path.exists(dst):
+                    try:
+                        os.link(src, dst)
+                        st = os.stat(src)
+                        new_pairs.append((f"{st.st_dev}:{st.st_ino}", {"view": dst, "src": src}))
+                    except OSError:
+                        pass
+        if linked + skipped < len(fs):
+            return ("failed", f"对账不平 {linked}+{skipped} != {len(fs)}", linked, skipped)
+        for k, v in new_pairs:
+            self._music_album_map[k] = v
+        return ("done", "", linked, skipped)
+
+    def _music_organize_pass(self, limit=5):
+        if self._music_org_busy or not self._music_ready:
+            return
+        self._music_org_busy = True
+        try:
+            root = self._music_download_root
+            done = self._state.setdefault("music_done", {})
+            failed = self._state.setdefault("music_failed", {})
+            try:
+                names = sorted(n for n in os.listdir(root)
+                               if n != "MUSIC" and os.path.isdir(os.path.join(root, n)))
+            except OSError:
+                return
+            todo = [n for n in names if n not in done and failed.get(n, {}).get("count", 0) < 2]
+            results = []
+            for name in todo[:limit]:
+                status, reason, linked, skipped = self._music_process_album(name)
+                if status == "done":
+                    done[name] = {"linked": linked, "skipped": skipped, "ts": int(time.time())}
+                    failed.pop(name, None)
+                    results.append(f"{name}（新链 {linked} 首，跳过 {skipped} 首）")
+                    self._audit("music_organized", name, f"新链 {linked} 首，跳过重复 {skipped} 首")
+                else:
+                    e = failed.setdefault(name, {"count": 0})
+                    e["count"] += 1
+                    e["reason"] = reason
+                    logger.warning(f"浣熊 音乐整理失败 {name}: {reason}")
+            if results:
+                self._save_state()
+                self._notify("浣熊 · 音乐整理",
+                             f"新整理了 {len(results)} 张专辑进音乐整理目录：\n" + "\n".join(results[:8]))
+        except Exception as e:
+            logger.error(f"浣熊 音乐整理异常: {e}", exc_info=True)
+        finally:
+            self._music_org_busy = False
+            self._state["music_last_organize"] = time.time()
+            self._save_state()
+
+    def _music_job_entry(self):
+        try:
+            for _ in range(60):
+                if self._music_ready:
+                    break
+                time.sleep(5)
+            self._music_organize_pass(limit=20)
+        finally:
+            if self._music_run_once:
+                self._music_run_once = False
+                try:
+                    cfg = self.get_config() or {}
+                    cfg["music_run_once"] = False
+                    self.update_config(cfg)
+                except Exception as e:
+                    logger.error(f"浣熊 复位 music_run_once 失败: {e}")
+
+    # ---------- 同步删除 ----------
+    def _music_detect(self):
+        if self._music_det_busy or not self._music_ready:
+            return
+        self._music_det_busy = True
+        try:
+            pend = self._state.setdefault("music_pending", [])
+            pend_keys = {p.get("key") for p in pend}
+            appr_keys = {i.get("key") for i in self._state.get("pending_approval", [])
+                         if i.get("kind") == "music"}
+            rejected = self._state.get("music_rejected", {})
+            now = time.time()
+            due = now + self._delete_delay_minutes * 60
+            changed = False
+            for kind, mp in (("album", self._music_album_map), ("base", self._music_base_map)):
+                for key in list(mp.keys()):
+                    pair = mp[key]
+                    v_ok = os.path.exists(pair["view"])
+                    s_ok = os.path.exists(pair["src"])
+                    if v_ok and s_ok:
+                        continue
+                    if not v_ok and not s_ok:
+                        mp.pop(key, None)
+                        continue
+                    if kind == "base" and not v_ok:
+                        # 基础配对：整理目录那份没了只是镜像消失，基础库原件不处理
+                        mp.pop(key, None)
+                        continue
+                    if key in pend_keys or key in appr_keys:
+                        continue
+                    if now - float(rejected.get(key, 0)) < 30 * 86400 and key in rejected:
+                        continue
+                    if kind == "base":
+                        target = pair["view"]
+                        evidence = ("音乐基础库里这首歌已经不在了，音乐整理目录里的镜像跟着删；"
+                                    "删的只是整理目录这份，基础库原件不涉及")
+                    elif not v_ok:
+                        target = pair["src"]
+                        evidence = ("音乐整理目录里这首歌已经删了，音乐做种目录里对应的原件跟着删，腾出空间")
+                    else:
+                        target = pair["view"]
+                        evidence = ("音乐做种目录里这首歌已经不在了，音乐整理目录里的整理份跟着删")
+                    pend.append({"kind": kind, "key": key, "twin": target,
+                                 "view": pair["view"], "src": pair["src"],
+                                 "detected": now, "due": due, "evidence": evidence})
+                    pend_keys.add(key)
+                    changed = True
+                    logger.info(f"浣熊 音乐联动待删: {target}")
+            if changed:
+                self._save_state()
+        except Exception as e:
+            logger.error(f"浣熊 音乐删除侦测异常: {e}", exc_info=True)
+        finally:
+            self._music_det_busy = False
+            self._state["music_last_detect"] = time.time()
+            self._save_state()
+
+    def _music_gates_pass(self, item):
+        twin = item.get("twin")
+        other = item.get("src") if twin == item.get("view") else item.get("view")
+        if other and os.path.exists(other):
+            return False, "另一侧文件又出现了（可能被恢复或重新整理）"
+        if not twin or not os.path.exists(twin):
+            return False, "要删的这份文件已经没了"
+        try:
+            st = os.stat(twin)
+        except OSError:
+            return False, "要删的这份文件读不到状态"
+        key = item.get("key") or ""
+        if ":" in key:
+            try:
+                kdev, kino = key.split(":", 1)
+                if (int(kdev), int(kino)) != (st.st_dev, st.st_ino):
+                    return False, "这份文件和当初登记的不是同一份了（登记已过期）"
+            except (ValueError, TypeError):
+                pass
+        if st.st_nlink >= 2:
+            return False, "这份文件还有别的硬链接在用"
+        return True, ""
+
+    def _music_cleanup_dirs(self, file_path):
+        parent = os.path.dirname(file_path)
+        for root in (self._music_library_root, self._music_download_root):
+            if not root or parent == root or not parent.startswith(root + "/"):
+                continue
+            cur = parent
+            while cur.startswith(root + "/") and cur != root:
+                try:
+                    os.rmdir(cur)
+                except OSError:
+                    break
+                cur = os.path.dirname(cur)
+
+    def _music_execute_delete(self, item, approved=False):
+        ok, reason = self._music_gates_pass(item)
+        if not ok:
+            logger.info(f"浣熊 取消音乐联动删除（{reason}）: {item.get('twin')}")
+            self._audit("music_delete_cancelled", item.get("twin"), reason)
+            return False
+        twin = item.get("twin")
+        try:
+            size = os.path.getsize(twin)
+            os.remove(twin)
+        except OSError as e:
+            logger.error(f"浣熊 音乐删除失败 {twin}: {e}")
+            return False
+        logger.info(f"浣熊 已同步删除（音乐）: {twin}")
+        self._audit("music_delete", twin, f"{item.get('evidence', '')}（{size} 字节）")
+        self._music_cleanup_dirs(twin)
+        mkind = item.get("mkind") or item.get("kind")
+        mp = self._music_album_map if mkind == "album" else self._music_base_map
+        mp.pop(item.get("key"), None)
+        return True
+
+    def _music_execute_pendings(self):
+        pend = self._state.get("music_pending", [])
+        if not pend:
+            return
+        now = time.time()
+        remain, changed, done_n = [], False, 0
+        for p in pend:
+            if now < p.get("due", 0):
+                remain.append(p)
+                continue
+            changed = True
+            if self._dry_run:
+                logger.info(f"浣熊（试运行）音乐删除到期未执行: {p.get('twin')}")
+                continue
+            if not self._auto_delete:
+                self._queue_approval({
+                    "kind": "music", "twin": p.get("twin"), "key": p.get("key"),
+                    "view": p.get("view"), "src": p.get("src"),
+                    "mkind": p.get("kind"), "detected": p.get("detected"),
+                    "evidence": p.get("evidence", "")})
+                continue
+            if self._music_execute_delete(p):
+                done_n += 1
+        self._state["music_pending"] = remain
+        if changed:
+            self._save_state()
+        if done_n:
+            self._notify("浣熊 · 音乐联动删除", f"已同步删除 {done_n} 份音乐文件（明细在审计流水里）")
